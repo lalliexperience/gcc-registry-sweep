@@ -1,5 +1,5 @@
-# gcc-postboot-watcher.sh — poll for the user's post-reboot console session, then fire the
-# param-ized gcc-postboot-verify.ps1 (-Alias) as that user via a ScreenConnect REST driver.
+# gcc-postboot-watcher.sh — poll for the user's post-reboot console session, then fire
+# gcc-one-pass.ps1 -PostBoot as that user via a ScreenConnect REST driver.
 #
 # WHY (field-proven 2026-11-17): after the gcc-one-pass reboot there is NO
 # auto-logon (quser empty). A driver dispatch of the postboot pass before the user signs
@@ -20,15 +20,16 @@ MAX=${4:-45}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DRIVER="${DRIVER:-$HERE/../dispatch/stage-fire-user-task.py}"
 SCCLIENT="${SCCLIENT:-$HERE/../dispatch/sc_restful_client.py}"
-SCRIPT="$HERE/gcc-postboot-verify.ps1"
+SCRIPT="$HERE/gcc-one-pass.ps1"
 LOG="C:\\Users\\$ALIAS\\AppData\\Local\\Temp\\gcc-postboot-*.log"
 STAGE="C:\\Users\\$ALIAS\\AppData\\Local\\Temp\\gcc-sweep"
 for i in $(seq 1 "$MAX"); do
   out=$(python3 "$SCCLIENT" run "$SC" "quser" --timeout 40 2>&1)
   if echo "$out" | grep -q "$ALIAS"; then
     echo "USER-DETECTED poll#$i $(date '+%H:%M:%S')"
-    python3 "$DRIVER" --sid "$SC" --local "$SCRIPT" --remote-name gcc-postboot-verify.ps1 \
-      --stage "$STAGE" --user "$ALIAS" --runlevel Highest --args "-Alias $ALIAS" \
+    python3 "$DRIVER" --sid "$SC" --local "$SCRIPT" --remote-name gcc-one-pass.ps1 \
+      --stage "$STAGE" --user "$ALIAS" --runlevel Highest \
+      --args "-PostBoot -UserDir C:\\Users\\$ALIAS\\AppData" \
       --log "$LOG" --poll-seconds 120
     rc=$?
     echo "POSTBOOT-DISPATCH-RETURNED rc=$rc"

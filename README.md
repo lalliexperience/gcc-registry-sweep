@@ -21,28 +21,44 @@ Every layer below was discovered by chasing a box that *came back broken* after 
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/gcc-one-pass.ps1` | **The canonical pass.** Kill order (broker host first) → Teams package data wipe → Outlook anchor delete → Explorer OCS-map/Substrate purge → user-context identity/Office/OneDrive/CredMan wipe → admin half (CloudAPCache, MS-Organization-Access certs, WorkplaceJoin trees, WebAccounts, IdentityStore per-SID, broker re-register) → licensing stores → **VERIFY** (`.us` + optional tenant-GUID scan) → structured failure log → 120s reboot. Idempotent — non-admin reruns cleanly after promotion. |
-| `scripts/gcc-postboot-verify.ps1` | Run after the reboot as the user: wipes the file-locked broker `Settings` leftover, re-deletes the Outlook anchor if it survived, independently re-verifies everything, probes the live OCS federation map (optional `-Domain`), fresh `dsregcmd`. |
-| `scripts/gcc-id-content-check.ps1` | Logon **re-seeds** of identity keys are EXPECTED — this checks their *content* for `.us`/old-tenant poison instead of existence. |
-| `scripts/gcc-token-elevation-probe.ps1` | 20-second pre-flight: does a dispatched task actually get an **elevated** token for this user? (Admin membership added *after* logon runs filtered — this probe prevents a wasted broken-box window on a failed pass.) |
-| `scripts/gcc-postboot-watcher.sh` | Polls `quser` and fires the post-boot pass the moment the user signs back in (a pre-reboot dispatch prints FIRED but the task sits queued forever — FIRED ≠ ran). Needs your own ScreenConnect/REST dispatch tooling. |
+| `scripts/gcc-one-pass.ps1` | **The whole tool - one script, two modes.** *Full scrub mode* (default): kill order (broker host first) → Teams package data wipe → Outlook anchor delete → Explorer OCS-map/Substrate purge → user-context identity/Office/OneDrive/CredMan wipe → admin half (CloudAPCache, MS-Organization-Access certs, WorkplaceJoin trees, WebAccounts, IdentityStore per-SID, broker re-register) → licensing stores → **VERIFY** (`.us` + optional tenant-GUID scan) → structured failure log → 120s reboot. Idempotent — non-admin reruns cleanly after promotion. *`-PostBoot` mode*: run after the reboot as the user — kills the broker host, wipes the file-locked `Settings` leftover, re-deletes the Outlook anchor if it survived, content-checks the re-seeded identity keys, re-verifies all file trees + DmsClient caches, probes the live OCS federation map (optional `-Domain`), fresh `dsregcmd`. |
+| `scripts/gcc-postboot-watcher.sh` | Optional: polls `quser` and fires `gcc-one-pass.ps1 -PostBoot` the moment the user signs back in (a pre-reboot dispatch prints FIRED but the task sits queued forever — FIRED ≠ ran). Needs your own ScreenConnect/REST dispatch tooling. |
 | `scripts/realm-flip-sampler.py` | Cross-cloud realm sampler for **drain-window verification** after a domain move (see the companion repo below). |
 
+### Why one script but two invocations
+
+The WAM broker's `Settings\settings.dat` is **file-locked** while `backgroundTaskHost` runs, and re-locks at logon — so a broker-settings leftover can only be reliably wiped *after* the reboot, in a fresh session. Everything else is deliberately atomic in the first pass: **ONE dispatch, ONE reboot, ONE broken-user window, no relapse window** — Teams is dead and empty *before* the user's first sign-in. Each wipe stage inside the script exists because skipping it was proven to cause a relapse (Teams auto-start re-seeds GCC from its own package cache; the Outlook `anchorMailbox` survives profile rebuilds; the Explorer OCS map steers every Office/OneDrive auth flow from *outside* the Office trees normal scrubs wipe; machine-level DmsClient caches survive every user pass; disabled WorkplaceJoin tasks stop the old join from rebuilding itself).
+
 **The clean-claim rule this tool is built around:** never declare a box clean after a wipe-verification. The only clean claim that counts is **the user signing in successfully on the new tenant** (Outlook first → Word already-activated → reboot → Teams SSO → OneDrive). Until then the state is *"scrubbed, unverified."*
+
+## Requirements (fleet-proven)
+
+- **Run it as the WORKING user, and that user must be a local admin.** The HKCU hive that must be scrubbed lives in the working user's profile — running it as an admin-only "elevation twin" account scrubs the wrong hive and fixes nothing. If the working user isn't an admin yet, **promote them first, then have them log off/on**: admin membership only lands in a fresh logon token. The promotion is temporary by design — demote the user once their sign-ins on the new tenant are verified. Add `-RequireElevation` to make the script abort *before any wipe* if the token is filtered (Medium Mandatory Level).
+- **Dispatch mechanism:** per-user scheduled task (Interactive + RunLevel Highest — no UAC prompt for an elevated user) or an elevated PowerShell console running as that user.
+- **Sign-out steps before clicking Yes** (the pre-flight popup lists these; processes are force-killed anyway, so save work first):
+  1. Sign out of **Outlook** (classic and new Outlook).
+  2. Sign out of **Teams** (quit fully).
+  3. Sign out of **OneDrive**.
+  4. Close **Word / Excel / PowerPoint / OneNote** (any open document is lost on force-kill).
+  5. No browser sign-outs are needed — this script has no browser layer by design.
 
 ## Usage
 
 Desk-side, **one machine at a time**, as the *working* user (their HKCU hive is what must be scrubbed — never run it as an elevation-only account):
 
 ```powershell
-# elevated per-user scheduled task (or run from an elevated PowerShell as the user)
+# 1) FULL SCRUB - elevated per-user scheduled task (or elevated PowerShell as the user)
 powershell -NoProfile -ExecutionPolicy Bypass -File gcc-one-pass.ps1 `
   -UserDir 'C:\Users\<alias>\AppData' -TenantId <old-tenant-GUID>
+
+# 2) POST-BOOT - after the reboot, as the user, BEFORE they open anything
+powershell -NoProfile -ExecutionPolicy Bypass -File gcc-one-pass.ps1 -PostBoot `
+  -UserDir 'C:\Users\<alias>\AppData' -TenantId <old-tenant-GUID> -Domain <cutover-domain>
 ```
 
 `-TenantId` is optional but recommended: it adds the old tenant's GUID to every file/registry scan. Without it, detection falls back to the generic GCC host markers (`microsoftonline.us` / `office365.us`).
 
-After the reboot: kill `backgroundTaskHost`, remove any broker `Settings` leftover, then run `gcc-postboot-verify.ps1 -Alias <alias> -Domain <cutover-domain>` before the user opens anything. Every run writes a timestamped log ending in `SUMMARY failures=N`; `ONE-PASS-COMPLETE-WITH-ERRORS` is **not** a clean pass.
+Every run writes a timestamped log ending in `SUMMARY failures=N`; `ONE-PASS-COMPLETE-WITH-ERRORS` and `POSTBOOT-VERIFY-HAS-ERRORS` are **not** clean passes. The full scrub shows a **pre-flight popup** on the user's desktop (sign-out checklist + elevation status + Yes/No confirm — declining aborts with nothing wiped); the post-boot pass shows a shorter "don't open apps yet" popup. Exit codes: `0` done, `2` bad parameters, `3` aborted by `-RequireElevation`, `4` pre-flight declined.
 
 **Warnings:** the box is intentionally broken for its user between script start and reboot (identity wiped, sign-in half-built). Wipes are backed up to `M365ScrubBackup\` first. The script schedules its own reboot (120 s) unless `-NoReboot`. Not for servers/domain controllers; test on one sacrificial VM first.
 
